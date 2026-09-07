@@ -1,39 +1,28 @@
 /*
  * input.cpp - medal controls for Missile Command (held upright, like Pac-Man)
  *
- * Missile Command is a trackball game, so tilt drives the trackball counters rather than a joystick:
- * the angle sets the speed, which is the closest a tilt sensor gets to a ball you spin.
+ * The buttons, the power rail, the coin-then-start sequence, the mute gesture and the tilt zero
+ * all live in components/medal_input, which every medal shares. What is left here is the part
+ * that is this game's own: turning two angles into a trackball.
  *
- * Both axes are measured against a neutral pose rather than against gravity directly. Held
- * upright, gravity lies in the plane of the panel, so the raw "pitch" the IMU reports is pinned
- * near its limit and can never swing both ways - which is exactly why up and down did nothing.
- * Instead:
- *   left/right - the direction of gravity within the panel plane, atan2(ay, ax): tilt the medal
- *                left or right the way you would for Pac-Man
- *   up/down    - how far gravity leaves that plane, atan2(az, hypot(ax, ay)): tip the top of
- *                the medal toward you or away from you
- * The neutral pose is captured on the first IMU read and again whenever a coin goes in, so
- * "however I am holding it right now" is always centre.
+ * Missile Command is a trackball game, so the tilt drives the ball's counters rather than a joystick's
+ * switches: the angle sets a speed, which is the closest a tilt sensor gets to something you
+ * spin. Fractional counts accumulate, so even a slow lean keeps moving, one count at a time.
  *
- *   BOOT button -> launch (cycles left / centre / right base)
- *   PWR short press -> coin, then start half a second later; long press (1 s) -> power off
+ *   twist left / right  -> the ball, left and right
+ *   tip away / toward   -> the ball, up and down
+ *   BOOT button         -> fire, taking each of the three bases in turn; hold 3 s for sound off and on
+ *   PWR short press     -> coin, then start half a second later; long press (1 s) -> power off
  */
 #include "input.h"
+#include "medal_input.h"
 #include "qmi8658.h"
-#include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "audio_hal.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include <math.h>
-#include "audio_hal.h"
 
 static const char *TAG = "INPUT";
-#define PIN_BTN_BOOT GPIO_NUM_9
-#define PIN_BTN_PWR  GPIO_NUM_18
-#define PIN_BAT_EN   GPIO_NUM_15
-#define IMU_PERIOD_US 16000
 
 #define DEADBAND_DEG   3.0f    /* no movement inside this much tilt */
 #define FULL_DEG      22.0f    /* this much tilt = full speed */
@@ -41,48 +30,29 @@ static const char *TAG = "INPUT";
 #define X_SIGN (-1.0f)         /* flip if left/right are reversed */
 #define Y_SIGN (-1.0f)         /* flip if up/down are reversed */
 
-static bool imu_ok, pwr_was_down, fire_was_down;
-static int64_t pwr_down_since, imu_last_us, coin_seq_start;
-static int coin_seq;                     /* 0 idle, 1 coin held, 2 gap, 3 start held */
-static float neutral_lr, neutral_ud;
-static bool have_neutral;
-static int base = 2;                     /* which base the next press launches from */
 static int16_t acc_x, acc_y;             /* 8.8 fixed point: counts owed but not yet delivered */
+static uint8_t base;                     /* which missile base the next press launches from */
+static bool fire_was_down;
 
-/* angles of gravity, in degrees: lr = within the panel plane, ud = out of it */
-/*
- * One reading, and whether it can be trusted. These angles are the direction of gravity within
- * the panel's plane and how far out of that plane it lies, and they only mean anything while
- * the medal is being held up: lying flat on a desk, gravity points straight out of the screen
- * and the in-plane angle is noise. Zeroing on a reading like that - which is exactly what
- * happened, because the first one was taken at boot with the medal on a desk - sets a centre
- * you were never holding, and leaves a control that works in one direction and not the other.
- */
-static bool read_angles(float *lr, float *ud)
+static void on_mute(void)
 {
-    int16_t ax, ay, az;
-    qmi8658_read_accel(&ax, &ay, &az);
-    float in_plane = sqrtf((float)ax * ax + (float)ay * ay);
-    *lr = atan2f((float)ay, (float)ax) * 57.2958f;
-    *ud = atan2f((float)az, in_plane) * 57.2958f;
-    return in_plane > 1.2f * fabsf((float)az);      /* held up, not lying down */
+    audio_set_mute(!audio_get_mute());
+    ESP_LOGI(TAG, "sound %s", audio_get_mute() ? "off" : "on");
 }
 
-static bool capture_neutral(void)
-{
-    float lr, ud;
-    if (!imu_ok || !read_angles(&lr, &ud)) return false;   /* try again next time */
-    neutral_lr = lr; neutral_ud = ud;
-    have_neutral = true;
-    acc_x = acc_y = 0;
-    return true;
-}
+/* a fresh zero means the ball starts from a standstill: drop whatever counts were owed */
+static void on_recentre(void) { acc_x = acc_y = 0; }
 
-static inline float wrap_deg(float d)
+void input_init(void)
 {
-    while (d > 180.0f) d -= 360.0f;
-    while (d < -180.0f) d += 360.0f;
-    return d;
+    medal_input_config_t cfg = {};
+    cfg.init_i2c = true;
+    cfg.imu_init = qmi8658_init;
+    cfg.read_accel = qmi8658_read_accel;
+    cfg.mute_hold_us = 3000000;
+    cfg.on_mute = on_mute;
+    cfg.on_recentre = on_recentre;
+    medal_input_init(&cfg);
 }
 
 /* tilt angle -> trackball counts per frame, in 8.8 fixed point */
@@ -96,89 +66,29 @@ static int16_t rate_from_angle(float deg, float sign)
     return (int16_t)(counts * 256.0f);
 }
 
-void input_init(void)
-{
-    gpio_config_t bat = {}; bat.pin_bit_mask = 1ULL << PIN_BAT_EN; bat.mode = GPIO_MODE_OUTPUT; gpio_config(&bat);
-    gpio_set_level(PIN_BAT_EN, 1);
-    gpio_config_t io = {}; io.pin_bit_mask = (1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR); io.mode = GPIO_MODE_INPUT; io.pull_up_en = GPIO_PULLUP_ENABLE; gpio_config(&io);
-    i2c_config_t i2c = {}; i2c.mode = I2C_MODE_MASTER; i2c.sda_io_num = GPIO_NUM_8; i2c.scl_io_num = GPIO_NUM_7;
-    i2c.sda_pullup_en = GPIO_PULLUP_ENABLE; i2c.scl_pullup_en = GPIO_PULLUP_ENABLE; i2c.master.clk_speed = 100000;
-    i2c_param_config(I2C_NUM_0, &i2c);
-    esp_err_t err = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_LOGW(TAG, "I2C init failed: %s", esp_err_to_name(err));
-    imu_ok = qmi8658_init();
-    ESP_LOGI(TAG, "input ready (IMU %s); neutral pose is captured on the first read and on each coin", imu_ok ? "ok" : "missing");
-}
-
-
-/* Holding the button for three seconds toggles the sound off and on. This is a thing people
- * wear places, and some of those places need to be quiet. */
-#define HOLD_MUTE_US 3000000
-static int64_t mute_down_since;
-static bool mute_armed, mute_fired;
-
-static void mute_gesture(bool boot, int64_t now)
-{
-    if (boot && !mute_armed) { mute_armed = true; mute_fired = false; mute_down_since = now; }
-    if (!boot) { mute_armed = false; return; }
-    if (!mute_fired && now - mute_down_since >= HOLD_MUTE_US) {
-        mute_fired = true;
-        audio_set_mute(!audio_get_mute());
-        ESP_LOGI("INPUT", "sound %s", audio_get_mute() ? "off" : "on");
-    }
-}
-
 void input_update(mc_input_t *in)
 {
-    int64_t now = esp_timer_get_time();
-    bool boot = gpio_get_level(PIN_BTN_BOOT) == 0;
-    mute_gesture(boot, now);
-    bool pwr = gpio_get_level(PIN_BTN_PWR) == 0;
+    medal_input_state_t st;
+    medal_input_poll(&st);
+
+    in->coin1  = st.coin ? 1 : 0;
+    in->start1 = st.start ? 1 : 0;
     /* One button, three missile bases: each press launches from the next base in turn, so all
      * thirty missiles stay reachable instead of only the ten in whichever base we picked. */
     in->fire1 = in->fire2 = in->fire3 = 0;
-    if (boot && !fire_was_down) {
-        if (!have_neutral) capture_neutral();
-        base = (base + 1) % 3;
-    }
-    if (boot) {
+    if (st.boot && !fire_was_down) base = (uint8_t)((base + 1) % 3);
+    if (st.boot) {
         if (base == 0) in->fire1 = 1; else if (base == 1) in->fire2 = 1; else in->fire3 = 1;
     }
-    fire_was_down = boot;
+    fire_was_down = st.boot;
 
-    if (pwr && !pwr_was_down) pwr_down_since = now;
-    if (pwr && now - pwr_down_since >= 1000000) {
-        ESP_LOGI(TAG, "power off");
-        gpio_set_level(PIN_BAT_EN, 0);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    if (!pwr && pwr_was_down && now - pwr_down_since < 400000 && coin_seq == 0) {
-        coin_seq = 1; coin_seq_start = now;
-        capture_neutral();                    /* a coin also re-centres however you are holding it */
-    }
-    pwr_was_down = pwr;
-
-    /* coin/start sequence: coin 100 ms, gap 400 ms, start 100 ms */
-    int64_t el = now - coin_seq_start;
-    in->coin1 = 0; in->start1 = 0;
-    switch (coin_seq) {
-        case 1: in->coin1 = 1; if (el > 100000) coin_seq = 2; break;
-        case 2: if (el > 500000) { coin_seq = 3; capture_neutral(); }  /* settled into playing posture */
-            break;
-        case 3: in->start1 = 1; if (el > 600000) coin_seq = 0; break;
-        default: break;
-    }
-
-    float lr, ud;
-    bool imu_due = imu_ok && now - imu_last_us >= IMU_PERIOD_US;
-    if (imu_due) imu_last_us = now;
-    /* nothing is captured or acted on until the medal is actually being held up */
-    if (imu_due && read_angles(&lr, &ud) && (have_neutral || capture_neutral())) {
-        int16_t rx = rate_from_angle(wrap_deg(lr - neutral_lr), X_SIGN);
-        int16_t ry = rate_from_angle(wrap_deg(ud - neutral_ud), Y_SIGN);
-        /* accumulate fractional counts so slow tilts still move, a count at a time */
-        acc_x += rx; acc_y += ry;
+    if (st.tilt_fresh) {
+        acc_x += rate_from_angle(st.lr, X_SIGN);
+        acc_y += rate_from_angle(st.ud, Y_SIGN);
+        /* hand over whole counts and keep the remainder for next time */
         in->track_x = (int8_t)(acc_x >> 8); acc_x -= (int16_t)(in->track_x << 8);
         in->track_y = (int8_t)(acc_y >> 8); acc_y -= (int16_t)(in->track_y << 8);
+    } else {
+        in->track_x = 0; in->track_y = 0;
     }
 }
